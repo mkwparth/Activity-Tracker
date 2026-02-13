@@ -1,6 +1,7 @@
 from dataclasses import dataclass, asdict, field
 import getpass
 import platform
+import random
 import socket
 import time
 from typing import Dict, Any, Optional
@@ -9,6 +10,7 @@ from datetime import datetime, timezone
 import json
 import threading
 import uuid
+import mss
 import pygetwindow as gw
 from pynput import mouse, keyboard
 
@@ -37,7 +39,10 @@ class SessionMetadata:
 
 @dataclass
 class ActivityObserver:
-    output_dir:Path = Path("./activity_logs")
+    output_logs_dir:Path = Path("./activity/logs")
+    output_screenshots_dir:Path = Path("./activity/screenshots")
+    _CAPTURES_PER_HOUR:int = field(init=False, default=4)
+
     mouse_throttle_ms: int = 250 # In ms so 4 events in 1 sec
     window_poll_interval: int = 1
 
@@ -51,12 +56,79 @@ class ActivityObserver:
     _current_window: Dict[str, Any] = field(init=False, default_factory=dict)
     _last_mouse_time: float = field(init=False, default=0.0)
 
+    # cursor_position
+    _last_cursor_pos:tuple = field(init=False, default=(0,0)) 
+
+    # threading stop event
+    _stop_event: bool = field(init=False, default=False)
+
     def __post_init__(self):
-        self.output_dir.mkdir(exist_ok=True)
+        self.output_logs_dir.mkdir(parents=True,exist_ok=True)
+        self.output_screenshots_dir.mkdir(parents=True,exist_ok=True)
 
     def _utc_now(self) -> str:
         """Get UTC time now"""
         return datetime.now(timezone.utc).isoformat()
+    
+
+    def _take_screenshot(self):
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        filename = self.output_screenshots_dir / f"screenshot_{timestamp}.png"
+
+        # get the cursor position
+        cursor_x, cursor_y = self._last_cursor_pos
+
+        with mss.mss() as sct:
+            monitors = sct.monitors
+            selected_monitor = None
+
+            for monitor in monitors[1:]:
+                left = monitor["left"]
+                top = monitor["top"]
+                width = monitor["width"]
+                height = monitor["height"]
+
+                if (left <= cursor_x < left + width) and (top <= cursor_y < top + height):
+                    selected_monitor = monitor
+                    break
+            
+            if selected_monitor is None:
+                selected_monitor = monitors[0]
+            
+            img = sct.grab(selected_monitor)
+            mss.tools.to_png(img.rgb, img.size, output=str(filename))
+            
+        print(f"Screenshot saved: {filename}")
+    
+    def _screenshot_scheduler(self,stop_event):
+
+        print("Screenshot scheduler started (6 per hour).:", stop_event)
+        while not stop_event.is_set():
+
+            # Generate 6 random seconds inside the next hour
+            random_times = sorted(random.sample(range(20), self._CAPTURES_PER_HOUR))
+
+            hour_start = time.time()
+
+            for offset in random_times:
+                if stop_event.is_set():
+                    break
+
+                target_time = hour_start + offset
+                sleep_time = target_time - time.time()
+
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+                if not stop_event.is_set():
+                    self._take_screenshot()
+
+            # Wait until full hour completes
+            remaining = hour_start + 20 - time.time()
+            if remaining > 0:
+                time.sleep(remaining)
+
+        print("Screenshot scheduler stopped.")
     
 
     def _window_monitor_loop(self):
@@ -103,6 +175,8 @@ class ActivityObserver:
         session_id = str(uuid.uuid4())
         start_time = self._utc_now()
 
+        # Threading is start
+        self._stop_event = threading.Event()
 
         self.session = SessionMetadata(
             session_id=session_id,
@@ -110,7 +184,7 @@ class ActivityObserver:
             hostname=socket.gethostname(),
             username=getpass.getuser(),
             os=f"{platform.system()} {platform.release()}",
-            output_file=str(self.output_dir / f"session_{session_id}.jsonl")
+            output_file=str(self.output_logs_dir / f"session_{session_id}.jsonl")
         )
 
         print(self.session.hostname, self.session.username, self.session.os)
@@ -125,6 +199,14 @@ class ActivityObserver:
             daemon=True
         )
         self._window_thread.start()
+
+        # Start Screenshot thread:
+        screenshot_thread = threading.Thread(
+            target=self._screenshot_scheduler,
+            args=(self._stop_event,),
+            daemon=True
+        )
+        screenshot_thread.start()
 
         self.mouse_listener = mouse.Listener(
                                             on_move=self._on_mouse_move,
@@ -176,6 +258,9 @@ class ActivityObserver:
     # mouse handlers
     def _on_mouse_move(self, x, y):
         now = time.time()
+
+        # store last cursor position
+        self._last_cursor_pos = (x,y)
 
         if(now - self._last_mouse_time) * 1000 < self.mouse_throttle_ms:
             return
