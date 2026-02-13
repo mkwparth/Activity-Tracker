@@ -33,12 +33,12 @@ class SessionMetadata:
     hostname: str
     username: str
     os: str
-    output_file: str    
+    output_file: str
 
 @dataclass
 class ActivityObserver:
     output_dir:Path = Path("./activity_logs")
-    mouse_throttle_ms: int = 250 # in ms so 4 events in 1 sec
+    mouse_throttle_ms: int = 250 # In ms so 4 events in 1 sec
     window_poll_interval: int = 1
 
     session: Optional[SessionMetadata] = field(init=False, default=None)
