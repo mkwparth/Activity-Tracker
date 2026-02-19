@@ -79,7 +79,7 @@ class ActivityObserver:
     
 
     def _take_screenshot(self):
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = self.output_screenshots_dir / f"screenshot_{timestamp}.png"
 
         # get the cursor position
