@@ -13,6 +13,9 @@ import uuid
 import mss
 import pygetwindow as gw
 from pynput import mouse, keyboard
+import gzip
+import shutil
+import requests
 
 @dataclass
 class Event:
@@ -43,6 +46,9 @@ class ActivityObserver:
     output_screenshots_dir:Path = Path("./activity/screenshots")
     _CAPTURES_PER_HOUR:int = field(init=False, default=4)
 
+    upload_interval_seconds: int = 30  # 5 minutes
+    backend_url: str = "http://localhost:8000/generate-upload-url"
+
     mouse_throttle_ms: int = 250 # In ms so 4 events in 1 sec
     window_poll_interval: int = 1
 
@@ -60,7 +66,8 @@ class ActivityObserver:
     _last_cursor_pos:tuple = field(init=False, default=(0,0)) 
 
     # threading stop event
-    _stop_event: bool = field(init=False, default=False)
+    _stop_event: threading.Event = field(init=False, default_factory=threading.Event)
+
 
     def __post_init__(self):
         self.output_logs_dir.mkdir(parents=True,exist_ok=True)
@@ -98,12 +105,11 @@ class ActivityObserver:
             img = sct.grab(selected_monitor)
             mss.tools.to_png(img.rgb, img.size, output=str(filename))
             
-        print(f"Screenshot saved: {filename}")
+        # print(f"Screenshot saved: {filename}")
     
-    def _screenshot_scheduler(self,stop_event):
-
-        print("Screenshot scheduler started (6 per hour).:", stop_event)
-        while not stop_event.is_set():
+    def _screenshot_scheduler(self):
+        print("Screenshot scheduler started:", self._stop_event)
+        while not self._stop_event.is_set():
 
             # Generate 6 random seconds inside the next hour
             random_times = sorted(random.sample(range(20), self._CAPTURES_PER_HOUR))
@@ -111,30 +117,33 @@ class ActivityObserver:
             hour_start = time.time()
 
             for offset in random_times:
-                if stop_event.is_set():
+                if self._stop_event.is_set():
                     break
 
                 target_time = hour_start + offset
                 sleep_time = target_time - time.time()
 
                 if sleep_time > 0:
-                    time.sleep(sleep_time)
+                    self._stop_event.wait(sleep_time)
 
-                if not stop_event.is_set():
+                if not self._stop_event.is_set():
                     self._take_screenshot()
 
             # Wait until full hour completes
             remaining = hour_start + 20 - time.time()
             if remaining > 0:
-                time.sleep(remaining)
+                self._stop_event.wait(remaining)
 
         print("Screenshot scheduler stopped.")
     
 
     def _window_monitor_loop(self):
-        while self.is_recording:
+        print("Window monitor started.")
+
+        while not self._stop_event.is_set():
             try:
                 win = gw.getActiveWindow()
+
                 if win:
                     self._current_window = {
                         "window_title": win.title,
@@ -147,10 +156,14 @@ class ActivityObserver:
                         "window_width": None,
                         "window_height": None
                     }
+
             except Exception:
                 pass
 
-            time.sleep(self.window_poll_interval)
+            # Instead of time.sleep(), use wait() for responsive shutdown
+            self._stop_event.wait(self.window_poll_interval)
+
+        print("Window monitor stopped.")
     
     def _get_active_window(self) -> Dict[str,Any]:
         """Get Active Window Info"""
@@ -194,19 +207,26 @@ class ActivityObserver:
         self.event_count = 0
 
         # Start Window Monitor Thread:
-        self._window_thread = threading.Thread(
+        window_thread = threading.Thread(
             target=self._window_monitor_loop,
             daemon=True
         )
-        self._window_thread.start()
+        window_thread.start()
 
         # Start Screenshot thread:
         screenshot_thread = threading.Thread(
             target=self._screenshot_scheduler,
-            args=(self._stop_event,),
             daemon=True
         )
         screenshot_thread.start()
+
+        # File uploading thread
+        upload_file_thread = threading.Thread(
+            target=self._upload_scheduler,
+            daemon=True
+        )
+        upload_file_thread.start()
+
 
         self.mouse_listener = mouse.Listener(
                                             on_move=self._on_mouse_move,
@@ -232,11 +252,95 @@ class ActivityObserver:
         self.mouse_listener.stop()
         self.keyboard_listener.stop()
 
+        self._stop_event.set()
+
         if self._log_file:
             self._log_file.close()
         
         print(f"Observer stopped. Total events: {self.event_count}")
         print(f"Data stored in: {self.session.output_file}")
+
+
+    
+    # Uploading file logic.
+    def _upload_scheduler(self):
+        print("Upload scheduler started.")
+        while not self._stop_event.is_set():
+
+            # Wait for upload interval OR stop signal
+            if self._stop_event.wait(self.upload_interval_seconds):
+                break  # stop_event triggered during wait
+
+            if not self.is_recording:
+                continue
+
+            try:
+                with self._lock:
+                    # Save the current file
+                    file_path = Path(self.session.output_file)
+                    
+                    # Close current file safely
+                    if self._log_file:
+                        self._log_file.flush()
+                        self._log_file.close()
+                    
+                    # Immediately open NEW file
+                    new_file = self.output_logs_dir / f"session_{uuid.uuid4()}.jsonl"
+                    self.session.output_file = str(new_file)
+                    self._log_file = open(new_file, "a", encoding="utf-8", buffering=1)
+
+                # Upload outside lock (important!)
+                self._upload_file(file_path)
+                   
+            except Exception as e:
+                print("Upload scheduler error:", e)
+
+        print("Upload scheduler stopped.")
+
+
+    def _upload_file(self, file_path: Path):
+        if not file_path.exists():
+            return
+
+        try:
+            print(f"Uploading {file_path.name}")
+
+            # Get presigned URL
+            response = requests.post(
+                self.backend_url,
+                json={
+                    "user_id": self.session.username,
+                    "session_id": self.session.session_id
+                }
+            )
+
+            if response.status_code != 200:
+                print("Failed to get presigned URL:", response.text)
+                return
+
+            upload_url = response.json()["upload_url"]
+            print("upload_url:", upload_url)
+
+            file_bytes = file_path.read_bytes()
+
+            # Upload RAW file directly
+            with open(file_path, "rb") as f:
+                upload_response = requests.put(
+                    upload_url,
+                    data=file_bytes,
+                    headers={
+                        "Content-Length":str(len(file_bytes))
+                    }
+                )
+
+            if upload_response.status_code == 200:
+                print("Upload successful")
+                file_path.unlink()  # delete local file
+            else:
+                print("Upload failed:", upload_response.text)
+
+        except Exception as e:
+            print("Upload error:", e)
 
     
     def _write_event(self, event_type:str, payload:Dict[str, Any]):
@@ -269,7 +373,7 @@ class ActivityObserver:
 
         self._write_event("mouse_move", {
             "x": x,
-            "y": y,
+            "y": y
         })
 
 
@@ -316,5 +420,5 @@ if __name__ == "__main__":
 
     print("recording for 20 sec....")
 
-    time.sleep(20)
+    time.sleep(120)
     observer.stop()
