@@ -1,5 +1,6 @@
 from dataclasses import dataclass, asdict, field
 import getpass
+from os import EX_CANTCREAT
 import platform
 import random
 import socket
@@ -254,9 +255,24 @@ class ActivityObserver:
 
         self._stop_event.set()
 
-        if self._log_file:
-            self._log_file.close()
-        
+
+        # Need to Upload last active file
+        try:
+            with self._lock:
+                if self._log_file:
+                    self._log_file.flush()
+                    self._log_file.close()
+
+                final_file = Path(self.session.output_file)
+
+            # Upload outside lock
+            if final_file.exists() and final_file.stat().st_size > 0:
+                print("Uploading final file before shutdown...")
+                self._upload_file(final_file)
+        except Exception as e:
+            print("Final Upload is failed :", e)
+
+
         print(f"Observer stopped. Total events: {self.event_count}")
         print(f"Data stored in: {self.session.output_file}")
 
