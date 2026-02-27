@@ -1,3 +1,6 @@
 activity_logs/
 test.py
 extractor/activity/
+activity/
+extractor/__pycache__
+__pycache__/
